@@ -80,9 +80,12 @@ public class RiskManager
         var totalRisk = positionSize * riskPerUnit;
         var riskRewardRatio = netProfit / totalRisk;
 
-        if (riskRewardRatio < 1.2m)
+        // Soglia sul R:R netto (dopo commissioni): 1.2 al massimo, ma mai più alta del 60% del R:R configurato
+        // (con R:R 1:1 il netto è per forza < 1, una soglia fissa a 1.2 scarterebbe ogni segnale)
+        var minNetRewardRatio = Math.Min(1.2m, _minRewardRatio * 0.6m);
+        if (riskRewardRatio < minNetRewardRatio)
         {
-            result.Reason = $"Risk-reward too low: {riskRewardRatio:F2} < 1.2 required";
+            result.Reason = $"Risk-reward too low: {riskRewardRatio:F2} < {minNetRewardRatio:F2} required";
             result.Rejection = RejectionReason.RiskRewardTooLow;
             return result;
         }
