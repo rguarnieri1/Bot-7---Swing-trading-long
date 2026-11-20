@@ -82,6 +82,12 @@ public class BacktestService
         var warmup = TimeSpan.FromTicks(Math.Max(TimeSpan.FromDays(MinWarmupDays).Ticks, TimeframeToTimeSpan(timeframe).Ticks * (WarmupCandles + 60)));
         var historyFrom = startDate - warmup;
 
+        // Regime BTC per ogni candela: calcolato solo sulle candele BTC disponibili fino a quel momento
+        var btcCandles = await _dataService.GetHistoricalCandlesAsync("BTC", timeframe, historyFrom, endDate);
+        var btcRegime = new Dictionary<DateTime, bool?>();
+        for (int i = 0; i < btcCandles.Count; i++)
+            btcRegime[btcCandles[i].Time] = SwingTradingLongStrategy.IsBtcBullish(Window(btcCandles, i));
+
         // 1) Scarica tutte le candele prima di simulare: il portafoglio va simulato in ordine cronologico
         //    su tutti i simboli insieme, per sapere in ogni momento quanto capitale è impegnato.
         var candlesBySymbol = new Dictionary<string, List<Candle>>();
@@ -164,7 +170,7 @@ public class BacktestService
                     if (openPositions.ContainsKey(symbol) || !indexBySymbol[symbol].TryGetValue(time, out var idx) || idx < WarmupCandles)
                         continue;
 
-                    var analysis = _strategy.Analyze(symbol, Window(candles, idx));
+                    var analysis = _strategy.Analyze(symbol, Window(candles, idx), btcRegime.GetValueOrDefault(time));
                     if (analysis.IsSignal)
                         candidates.Add((symbol, candles[idx], analysis));
                 }

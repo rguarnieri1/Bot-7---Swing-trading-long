@@ -180,6 +180,10 @@ public class BotSchedulerService
             {
                 Console.WriteLine($"🕯️  Candela {_timeframe} chiusa alle {lastCloseEnd:yyyy-MM-dd HH:mm} UTC: ricerca segnali");
 
+                // Regime di mercato BTC (sopra/sotto la EMA50) sulla candela appena chiusa: filtro del long
+                var btcBullish = SwingTradingLongStrategy.IsBtcBullish(ClosedCandles(await GetCandlesCachedAsync("BTC"), now));
+                Console.WriteLine($"₿ Regime BTC: {(btcBullish == null ? "sconosciuto (nessun segnale)" : btcBullish.Value ? "rialzista (long consentiti)" : "ribassista (nessun long)")}");
+
                 _lastScannedCandle = lastClosedTime;
                 var cryptos = await _dataService.GetLargeCapCryptocurrenciesAsync();
                 cycle.CryptosAnalyzed = cryptos.Count;
@@ -225,7 +229,7 @@ public class BotSchedulerService
                         }
 
                         // ✅ STRATEGIA PRINCIPALE: Swing Trading Long
-                        var emaRibbonResult = _emaRibbonStrategy.Analyze(crypto.Symbol, candles);
+                        var emaRibbonResult = _emaRibbonStrategy.Analyze(crypto.Symbol, candles, btcBullish);
 
                         if (emaRibbonResult.IsSignal)
                             candidates.Add((crypto, emaRibbonResult, candles));
@@ -430,6 +434,7 @@ public class BotSchedulerService
         RejectionReason.ProfitBelowCommissions => "Risk Manager: profitto non copre commissioni",
         RejectionReason.RiskRewardTooLow => "Risk Manager: rapporto rischio/rendimento insufficiente",
         RejectionReason.StopLossError => "Stop non valido o troppo largo",
+        RejectionReason.AgainstBtcRegime => "Strategia: contro il regime BTC",
         _ => "Scarto non classificato"
     };
 

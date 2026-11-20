@@ -21,7 +21,19 @@ public class SwingTradingLongStrategy
     private const decimal MaxStopPercent = 0.15m; // stop più largo del 15% = setup scartato
     public const int MinCandles = SlowEma + 20;
 
-    public AnalysisResult Analyze(string symbol, List<Candle> candles)
+    private const int BtcRegimeEmaPeriod = 50;
+
+    // Regime di mercato: true se BTC chiude sopra la sua EMA50, false se sotto, null se dati insufficienti.
+    public static bool? IsBtcBullish(List<Candle> btcCandles)
+    {
+        var ema = TechnicalIndicators.CalculateEMA(btcCandles.Select(c => c.Close).ToList(), BtcRegimeEmaPeriod);
+        if (ema.Count == 0)
+            return null;
+        return btcCandles.Last().Close > ema.Last();
+    }
+
+    // btcBullish: filtro di mercato, il long è consentito solo con BTC rialzista (sopra la EMA50).
+    public AnalysisResult Analyze(string symbol, List<Candle> candles, bool? btcBullish)
     {
         var result = new AnalysisResult
         {
@@ -61,6 +73,13 @@ public class SwingTradingLongStrategy
         var e50 = E50(0);
         result.Indicators["EMA20"] = e20;
         result.Indicators["EMA50"] = e50;
+
+        // 0) Regime BTC
+        if (btcBullish != true)
+        {
+            result.Rejection = RejectionReason.AgainstBtcRegime;
+            return result;
+        }
 
         // 1) Trend di fondo
         if (!(last.Close > e50 && e20 > e50 && e50 > E50(5)))

@@ -35,7 +35,8 @@ public enum RejectionReason
     MaxConcurrentTrades,
     ProfitBelowCommissions,
     RiskRewardTooLow,
-    StopLossError
+    StopLossError,
+    AgainstBtcRegime
 }
 
 public class AnalysisResult
