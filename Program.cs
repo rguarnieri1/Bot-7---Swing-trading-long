@@ -1,5 +1,6 @@
 ﻿using BotCripto.Data;
 using BotCripto.Services;
+using BotCripto.Strategies;
 using Newtonsoft.Json.Linq;
 
 // Log su file dell'output solo per i backtest (Logs/backtest_yyyy-MM-dd.log).
@@ -68,6 +69,23 @@ else if (isRealBacktestMode)
             symbolsFile = cmdArgs[++a];
         else if (cmdArgs[a] == "--rr" && a + 1 < cmdArgs.Length)
             rewardRisk = decimal.Parse(cmdArgs[++a], System.Globalization.CultureInfo.InvariantCulture);
+        // Override dei parametri della strategia (StrategyOptions) per confrontare le varianti
+        else if (cmdArgs[a] == "--rsi" && a + 1 < cmdArgs.Length)
+            StrategyOptions.RsiPullback = decimal.Parse(cmdArgs[++a], System.Globalization.CultureInfo.InvariantCulture);
+        else if (cmdArgs[a] == "--vol-mult" && a + 1 < cmdArgs.Length)
+            StrategyOptions.VolumeMultiplier = decimal.Parse(cmdArgs[++a], System.Globalization.CultureInfo.InvariantCulture);
+        else if (cmdArgs[a] == "--max-hold" && a + 1 < cmdArgs.Length)
+            StrategyOptions.MaxHoldCandles = int.Parse(cmdArgs[++a]);
+        else if (cmdArgs[a] == "--no-volume")
+            StrategyOptions.RequireVolume = false;
+        else if (cmdArgs[a] == "--btc-ema" && a + 1 < cmdArgs.Length)
+            StrategyOptions.BtcRegimeEma = int.Parse(cmdArgs[++a]);
+        else if (cmdArgs[a] == "--min-breadth" && a + 1 < cmdArgs.Length)
+            StrategyOptions.MinBreadth = decimal.Parse(cmdArgs[++a], System.Globalization.CultureInfo.InvariantCulture);
+        else if (cmdArgs[a] == "--max-signals" && a + 1 < cmdArgs.Length)
+            StrategyOptions.MaxSignalsPerCycle = int.Parse(cmdArgs[++a]);
+        else if (cmdArgs[a] == "--be" && a + 1 < cmdArgs.Length)
+            StrategyOptions.BreakevenAtR = decimal.Parse(cmdArgs[++a], System.Globalization.CultureInfo.InvariantCulture);
         else
             positional.Add(cmdArgs[a]);
     }

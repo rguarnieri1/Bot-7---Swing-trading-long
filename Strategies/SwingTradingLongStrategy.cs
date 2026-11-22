@@ -16,20 +16,46 @@ public class SwingTradingLongStrategy
     private const int SwingLookback = 10;        // candele per il minimo dello swing (stop)
     private const int AtrPeriod = 14;
     private const decimal AtrStopBuffer = 0.5m;  // buffer sotto lo swing, in ATR
-    private const decimal RsiPullback = 50m;     // l'RSI deve essere sceso sotto questa soglia durante il ritracciamento
     private const decimal RsiMax = 70m;
     private const decimal MaxStopPercent = 0.15m; // stop più largo del 15% = setup scartato
     public const int MinCandles = SlowEma + 20;
 
-    private const int BtcRegimeEmaPeriod = 50;
+    // Candele minime di BTC per valutare il regime (EMA lenta + qualche candela per la pendenza della EMA50)
+    public static int BtcRegimeMinCandles => StrategyOptions.BtcRegimeEma + 5;
 
-    // Regime di mercato: true se BTC chiude sopra la sua EMA50, false se sotto, null se dati insufficienti.
+    // Regime di mercato: true se BTC chiude sopra la EMA lenta (default EMA200) e la EMA50 è in salita,
+    // false altrimenti, null se i dati sono insufficienti.
     public static bool? IsBtcBullish(List<Candle> btcCandles)
     {
-        var ema = TechnicalIndicators.CalculateEMA(btcCandles.Select(c => c.Close).ToList(), BtcRegimeEmaPeriod);
+        var closes = btcCandles.Select(c => c.Close).ToList();
+        var slow = TechnicalIndicators.CalculateEMA(closes, StrategyOptions.BtcRegimeEma);
+        var mid = TechnicalIndicators.CalculateEMA(closes, SlowEma);
+        if (slow.Count == 0 || mid.Count < 6)
+            return null;
+        return closes.Last() > slow.Last() && mid.Last() > mid[mid.Count - 6];
+    }
+
+    // Per la breadth di mercato: true se la moneta chiude sopra la propria EMA50, null se dati insufficienti.
+    public static bool? IsAboveEma50(List<Candle> candles)
+    {
+        var ema = TechnicalIndicators.CalculateEMA(candles.Select(c => c.Close).ToList(), SlowEma);
         if (ema.Count == 0)
             return null;
-        return btcCandles.Last().Close > ema.Last();
+        return candles.Last().Close > ema.Last();
+    }
+
+    // Quota di monete sopra la propria EMA50; null se le monete valutabili sono troppo poche.
+    public static decimal? CalculateBreadth(IEnumerable<List<Candle>> candlesPerSymbol)
+    {
+        int above = 0, total = 0;
+        foreach (var candles in candlesPerSymbol)
+        {
+            var a = IsAboveEma50(candles);
+            if (a == null) continue;
+            total++;
+            if (a.Value) above++;
+        }
+        return total >= StrategyOptions.MinBreadthSamples ? (decimal)above / total : null;
     }
 
     // btcBullish: filtro di mercato, il long è consentito solo con BTC rialzista (sopra la EMA50).
@@ -93,7 +119,7 @@ public class SwingTradingLongStrategy
         for (int back = 1; back <= PullbackLookback; back++)
         {
             var c = candles[candles.Count - 1 - back];
-            if (c.Low <= E20(back) && c.Low >= E50(back) * 0.97m && Rsi(back) < RsiPullback)
+            if (c.Low <= E20(back) && c.Low >= E50(back) * 0.97m && Rsi(back) < StrategyOptions.RsiPullback)
             {
                 pullback = true;
                 break;
@@ -113,6 +139,22 @@ public class SwingTradingLongStrategy
         {
             result.Rejection = RejectionReason.RsiExtreme;
             return result;
+        }
+
+        // 4) Volume: la candela di ripartenza deve avere volume superiore alla media delle 20 precedenti
+        if (StrategyOptions.RequireVolume)
+        {
+            var avgVolume = candles.Skip(candles.Count - 1 - StrategyOptions.VolumeLookback).Take(StrategyOptions.VolumeLookback).Average(c => c.Volume);
+            if (avgVolume <= 0)
+            {
+                result.Rejection = RejectionReason.NoVolumeData;
+                return result;
+            }
+            if (last.Volume <= avgVolume * StrategyOptions.VolumeMultiplier)
+            {
+                result.Rejection = RejectionReason.VolumeInsufficient;
+                return result;
+            }
         }
 
         // Stop sotto lo swing low recente, con buffer ATR

@@ -181,7 +181,7 @@ public class BotSchedulerService
             {
                 Console.WriteLine($"🕯️  Candela {_timeframe} chiusa alle {lastCloseEnd:yyyy-MM-dd HH:mm} UTC: ricerca segnali");
 
-                // Regime di mercato BTC (sopra/sotto la EMA50) sulla candela appena chiusa: filtro del long
+                // Regime di mercato BTC (sopra EMA200 con EMA50 in salita) sulla candela appena chiusa: filtro del long
                 var btcBullish = SwingTradingLongStrategy.IsBtcBullish(ClosedCandles(await GetCandlesCachedAsync("BTC"), now));
                 Console.WriteLine($"₿ Regime BTC: {(btcBullish == null ? "sconosciuto (nessun segnale)" : btcBullish.Value ? "rialzista (long consentiti)" : "ribassista (nessun long)")}");
 
@@ -195,9 +195,26 @@ public class BotSchedulerService
                 var registeredSignals = allTrades.Where(t => t.SignalCandleTime == lastClosedTime).Select(t => t.Symbol).ToHashSet();
 
                 // Scarica in parallelo (con limite) solo i simboli che verranno analizzati; gli errori emergono nel loop per simbolo
-                var toFetch = cryptos.Where(c => !openSymbols.Contains(c.Symbol) && !registeredSignals.Contains(c.Symbol)).Select(c => GetCandlesCachedAsync(c.Symbol)).ToList();
+                // (tutti i simboli: servono anche per la breadth di mercato)
+                var toFetch = cryptos.Select(c => GetCandlesCachedAsync(c.Symbol)).ToList();
                 try { await Task.WhenAll(toFetch); } catch { /* gestito per simbolo più sotto */ }
                 var candidates = new List<(Cryptocurrency crypto, AnalysisResult analysis, List<Candle> candles)>();
+
+                // Breadth di mercato: quota di monete sopra la propria EMA50 sulla candela appena chiusa
+                var breadthWindows = new List<List<Candle>>();
+                foreach (var c in cryptos)
+                {
+                    try
+                    {
+                        var closed = ClosedCandles(await GetCandlesCachedAsync(c.Symbol), now);
+                        if (closed.Count >= MinCandlesForAnalysis && closed.Last().Time == lastClosedTime)
+                            breadthWindows.Add(closed);
+                    }
+                    catch { /* simbolo senza dati: escluso dalla breadth */ }
+                }
+                var breadth = SwingTradingLongStrategy.CalculateBreadth(breadthWindows);
+                bool breadthOk = StrategyOptions.MinBreadth <= 0 || (breadth != null && breadth >= StrategyOptions.MinBreadth);
+                Console.WriteLine($"🌡️  Breadth: {(breadth == null ? "n/d" : breadth.Value.ToString("P0"))} (soglia {StrategyOptions.MinBreadth:P0}) → {(breadthOk ? "long consentiti" : "nessun nuovo long")}");
 
                 foreach (var crypto in cryptos)
                 {
@@ -232,7 +249,9 @@ public class BotSchedulerService
                         // ✅ STRATEGIA PRINCIPALE: Swing Trading Long
                         var emaRibbonResult = _emaRibbonStrategy.Analyze(crypto.Symbol, candles, btcBullish);
 
-                        if (emaRibbonResult.IsSignal)
+                        if (emaRibbonResult.IsSignal && !breadthOk)
+                            CountRejection("Strategia: breadth di mercato insufficiente");
+                        else if (emaRibbonResult.IsSignal)
                             candidates.Add((crypto, emaRibbonResult, candles));
                         else
                             CountRejection(RejectionLabel(emaRibbonResult.Rejection));
@@ -245,7 +264,15 @@ public class BotSchedulerService
                 }
 
                 // Dal segnale più forte al più debole (capitale illimitato: entrano tutti i segnali validi)
-                foreach (var (crypto, emaRibbonResult, candles) in candidates.OrderByDescending(c => c.analysis.Indicators.GetValueOrDefault("SignalStrength")))
+                var ranked = candidates.OrderByDescending(c => c.analysis.Indicators.GetValueOrDefault("SignalStrength")).ToList();
+                if (StrategyOptions.MaxSignalsPerCycle > 0 && ranked.Count > StrategyOptions.MaxSignalsPerCycle)
+                {
+                    for (int i = 0; i < ranked.Count - StrategyOptions.MaxSignalsPerCycle; i++)
+                        CountRejection("Strategia: oltre il massimo di segnali per candela");
+                    ranked = ranked.Take(StrategyOptions.MaxSignalsPerCycle).ToList();
+                }
+
+                foreach (var (crypto, emaRibbonResult, candles) in ranked)
                 {
                     var isLong = emaRibbonResult.Signal.Contains("BUY");
                     // Ingresso alla chiusura della candela del segnale (come nel backtest), non al prezzo live:
@@ -389,24 +416,46 @@ public class BotSchedulerService
             try
             {
                 var candles = await getCandlesAsync(trade.Symbol);
+                // Lo stop iniziale resta in trade.StopLoss: il breakeven si ricostruisce rigiocando le candele in ordine
+                // (stesso comportamento del backtest), così non serve salvare lo stop spostato.
+                var currentStop = trade.StopLoss;
+                var initialRisk = trade.EntryPrice - trade.StopLoss;
+                int candlesHeld = 0;
                 foreach (var candle in candles.Where(c => c.Time > trade.SignalCandleTime))
                 {
-                    bool hitStop = trade.IsLong ? candle.Low <= trade.StopLoss : candle.High >= trade.StopLoss;
+                    bool hitStop = trade.IsLong ? candle.Low <= currentStop : candle.High >= currentStop;
                     bool hitTarget = trade.IsLong ? candle.High >= trade.TargetPrice : candle.Low <= trade.TargetPrice;
-                    if (!hitStop && !hitTarget)
+
+                    // Uscita a tempo: conta solo le candele chiuse (quella in formazione non ha ancora un prezzo di chiusura)
+                    bool timeStop = false;
+                    if (!hitStop && !hitTarget && candle.Time + _timeframeSpan <= DateTime.UtcNow)
+                    {
+                        candlesHeld++;
+                        timeStop = StrategyOptions.MaxHoldCandles > 0 && candlesHeld >= StrategyOptions.MaxHoldCandles;
+                    }
+
+                    if (!hitStop && !hitTarget && !timeStop)
+                    {
+                        if (StrategyOptions.BreakevenAtR > 0 && trade.IsLong && currentStop < trade.EntryPrice
+                            && candle.High >= trade.EntryPrice + initialRisk * StrategyOptions.BreakevenAtR)
+                            currentStop = trade.EntryPrice;
                         continue;
+                    }
 
                     // Gap oltre lo stop: l'uscita avviene all'apertura della candela, non al prezzo di stop
-                    var exitPrice = hitStop
-                        ? (trade.IsLong ? Math.Min(candle.Open, trade.StopLoss) : Math.Max(candle.Open, trade.StopLoss))
-                        : trade.TargetPrice;
+                    var exitPrice = timeStop
+                        ? candle.Close
+                        : hitStop
+                            ? (trade.IsLong ? Math.Min(candle.Open, currentStop) : Math.Max(candle.Open, currentStop))
+                            : trade.TargetPrice;
+                    var exitLabel = timeStop ? "Time stop" : hitStop ? "Stop loss" : "Target";
                     var profitCalc = _riskManager.CalculateProfitAndTaxes(
                         trade.EntryPrice, exitPrice, trade.PositionSize, trade.IsLong);
                     var profit = profitCalc.NetProfitBeforeTax; // tasse sul saldo netto del periodo, non per trade
                     var profitPercent = profit / (trade.EntryPrice * trade.PositionSize) * 100;
 
-                    _reportingService.ClosePaperTrade(trade, exitPrice, profit, profitPercent, hitStop ? "Stop loss" : "Target");
-                    Console.WriteLine($"   {(profit > 0 ? "✅" : "❌")} Chiuso {trade.Symbol} {(trade.IsLong ? "LONG" : "SHORT")} per {(hitStop ? "stop loss" : "target")}: €{profit:F2} ({profitPercent:F2}%)");
+                    _reportingService.ClosePaperTrade(trade, exitPrice, profit, profitPercent, exitLabel);
+                    Console.WriteLine($"   {(profit > 0 ? "✅" : "❌")} Chiuso {trade.Symbol} {(trade.IsLong ? "LONG" : "SHORT")} per {exitLabel.ToLowerInvariant()}: €{profit:F2} ({profitPercent:F2}%)");
                     closed++;
                     break;
                 }

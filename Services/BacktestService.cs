@@ -27,6 +27,28 @@ public class BacktestService
         return candles.GetRange(start, idx + 1 - start);
     }
 
+    // Cache su disco delle candele scaricate (solo se la variabile d'ambiente BOT7_CANDLE_CACHE punta a una cartella):
+    // permette di confrontare più varianti della strategia senza riscaricare lo storico ogni volta.
+    private async Task<List<Candle>> GetCandlesWithCacheAsync(string symbol, string timeframe, DateTime from, DateTime to)
+    {
+        var dir = Environment.GetEnvironmentVariable("BOT7_CANDLE_CACHE");
+        if (string.IsNullOrWhiteSpace(dir))
+            return await _dataService.GetHistoricalCandlesAsync(symbol, timeframe, from, to);
+
+        Directory.CreateDirectory(dir);
+        var file = Path.Combine(dir, $"{symbol}_{timeframe}_{from:yyyyMMdd}_{to:yyyyMMdd}.json");
+        try
+        {
+            if (File.Exists(file))
+                return Newtonsoft.Json.JsonConvert.DeserializeObject<List<Candle>>(File.ReadAllText(file)) ?? new List<Candle>();
+        }
+        catch { /* cache illeggibile: si riscarica */ }
+
+        var candles = await _dataService.GetHistoricalCandlesAsync(symbol, timeframe, from, to);
+        try { File.WriteAllText(file, Newtonsoft.Json.JsonConvert.SerializeObject(candles)); } catch { }
+        return candles;
+    }
+
     private readonly CryptoDataService _dataService;
     private readonly RiskManager _riskManager;
     private readonly SwingTradingLongStrategy _strategy;
@@ -75,34 +97,56 @@ public class BacktestService
         int totalFiltered = 0;
         int candleSetsAnalyzed = 0;
         int closedAtEnd = 0;
+        int breadthBlockedDays = 0;
         int maxConcurrent = 0;
         DateTime? earliestTestedCandle = null;
         DateTime? latestTestedCandle = null;
 
-        // Riscaldamento: almeno WarmupCandles + 60 candele del timeframe (es. 1d → 120 giorni), minimo 20 giorni
-        var warmup = TimeSpan.FromTicks(Math.Max(TimeSpan.FromDays(MinWarmupDays).Ticks, TimeframeToTimeSpan(timeframe).Ticks * (WarmupCandles + 60)));
+        // Riscaldamento: abbastanza candele per la EMA di regime di BTC (default EMA200) e per la strategia, minimo 20 giorni
+        var warmupCandles = Math.Max(WarmupCandles + 60, SwingTradingLongStrategy.BtcRegimeMinCandles + 20);
+        var warmup = TimeSpan.FromTicks(Math.Max(TimeSpan.FromDays(MinWarmupDays).Ticks, TimeframeToTimeSpan(timeframe).Ticks * warmupCandles));
         var historyFrom = startDate - warmup;
 
         // Regime BTC per ogni candela: calcolato solo sulle candele BTC disponibili fino a quel momento
-        var btcCandles = await _dataService.GetHistoricalCandlesAsync("BTC", timeframe, historyFrom, endDate);
+        var btcCandles = (await GetCandlesWithCacheAsync("BTC", timeframe, historyFrom, endDate)).OrderBy(c => c.Time).ToList();
         var btcRegime = new Dictionary<DateTime, bool?>();
         for (int i = 0; i < btcCandles.Count; i++)
             btcRegime[btcCandles[i].Time] = SwingTradingLongStrategy.IsBtcBullish(Window(btcCandles, i));
+
+        // Contesto BTC per l'analisi dei trade (solo diagnostica): distanza % dalla EMA200 e rendimento a 10 candele
+        var btcClosesAll = btcCandles.Select(c => c.Close).ToList();
+        var btcEma200 = TechnicalIndicators.CalculateEMA(btcClosesAll, 200);
+        var btcDist = new Dictionary<DateTime, decimal>();
+        var btcRet10 = new Dictionary<DateTime, decimal>();
+        for (int i = 0; i < btcCandles.Count; i++)
+        {
+            if (i >= 199) btcDist[btcCandles[i].Time] = btcCandles[i].Close / btcEma200[i - 199] - 1m;
+            if (i >= 10) btcRet10[btcCandles[i].Time] = btcCandles[i].Close / btcCandles[i - 10].Close - 1m;
+        }
+        var tradeFeatures = new Dictionary<string, string>();
+        var breadthHistory = new List<decimal>();
 
         // 1) Scarica tutte le candele prima di simulare: il portafoglio va simulato in ordine cronologico
         //    su tutti i simboli insieme, per sapere in ogni momento quanto capitale è impegnato.
         var candlesBySymbol = new Dictionary<string, List<Candle>>();
         var indexBySymbol = new Dictionary<string, Dictionary<DateTime, int>>();
+        var aboveEma50BySymbol = new Dictionary<string, bool?[]>();
         foreach (var symbol in symbols)
         {
             try
             {
-                var candles = await _dataService.GetHistoricalCandlesAsync(symbol, timeframe, historyFrom, endDate);
+                var candles = await GetCandlesWithCacheAsync(symbol, timeframe, historyFrom, endDate);
                 if (candles.Count < WarmupCandles + 20)
                     continue; // troppo pochi dati per un warmup + una finestra di test minima
 
                 candles = candles.OrderBy(c => c.Time).ToList();
                 candlesBySymbol[symbol] = candles;
+                // EMA50 calcolata una sola volta sull'intera serie: serve alla breadth (sopra/sotto EMA50 per ogni candela)
+                var ema50 = TechnicalIndicators.CalculateEMA(candles.Select(c => c.Close).ToList(), 50);
+                var above = new bool?[candles.Count];
+                for (int k = 0; k < ema50.Count; k++)
+                    above[k + 49] = candles[k + 49].Close > ema50[k];
+                aboveEma50BySymbol[symbol] = above;
                 indexBySymbol[symbol] = candles.Select((c, i) => (c.Time, i)).ToDictionary(x => x.Time, x => x.i);
                 candleSetsAnalyzed++;
             }
@@ -159,24 +203,72 @@ public class BacktestService
 
                 // Se in una stessa candela vengono toccati entrambi, assumiamo lo stop loss (ipotesi conservativa)
                 if (hitStop || hitTarget)
+                {
                     ClosePosition(symbol, hitStop ? pos.StopLoss : pos.Target, time, !hitStop);
+                    continue;
+                }
+
+                // Uscita a tempo (test): dopo N candele senza stop/target si esce alla chiusura
+                pos.Held++;
+                if (StrategyOptions.MaxHoldCandles > 0 && pos.Held >= StrategyOptions.MaxHoldCandles)
+                {
+                    ClosePosition(symbol, candle.Close, time, candle.Close > pos.Trade.EntryPrice);
+                    continue;
+                }
+
+                // Breakeven: se la candela ha raggiunto +N×rischio, dalla candela successiva lo stop passa al prezzo di ingresso
+                if (StrategyOptions.BreakevenAtR > 0 && pos.IsLong && pos.StopLoss < pos.Trade.EntryPrice
+                    && candle.High >= pos.Trade.EntryPrice + pos.InitialRisk * StrategyOptions.BreakevenAtR)
+                    pos.StopLoss = pos.Trade.EntryPrice;
             }
 
             // b) Nuovi segnali (solo dentro la finestra richiesta), dal più forte al più debole:
             if (time >= startDate)
             {
                 var candidates = new List<(string symbol, Candle candle, AnalysisResult analysis)>();
-                foreach (var (symbol, candles) in candlesBySymbol)
-                {
-                    if (openPositions.ContainsKey(symbol) || !indexBySymbol[symbol].TryGetValue(time, out var idx) || idx < WarmupCandles)
-                        continue;
 
-                    var analysis = _strategy.Analyze(symbol, Window(candles, idx), btcRegime.GetValueOrDefault(time));
-                    if (analysis.IsSignal)
-                        candidates.Add((symbol, candles[idx], analysis));
+                // Breadth di mercato: quota di monete sopra la propria EMA50; sotto soglia non si aprono nuovi long
+                bool breadthOk = true;
+                decimal breadthNow = 0m;
+                {
+                    int above = 0, total = 0;
+                    foreach (var symbol in candlesBySymbol.Keys)
+                    {
+                        if (!indexBySymbol[symbol].TryGetValue(time, out var bIdx) || bIdx < WarmupCandles)
+                            continue;
+                        var a = aboveEma50BySymbol[symbol][bIdx];
+                        if (a == null) continue;
+                        total++;
+                        if (a.Value) above++;
+                    }
+                    breadthNow = total > 0 ? (decimal)above / total : 0m;
+                    breadthHistory.Add(breadthNow);
+                    if (StrategyOptions.MinBreadth > 0)
+                    {
+                        breadthOk = total >= StrategyOptions.MinBreadthSamples && breadthNow >= StrategyOptions.MinBreadth;
+                        if (!breadthOk)
+                            breadthBlockedDays++;
+                    }
                 }
 
-                foreach (var (symbol, candle, analysis) in candidates.OrderByDescending(c => c.analysis.Indicators.GetValueOrDefault("SignalStrength")))
+                if (breadthOk)
+                {
+                    foreach (var (symbol, candles) in candlesBySymbol)
+                    {
+                        if (openPositions.ContainsKey(symbol) || !indexBySymbol[symbol].TryGetValue(time, out var idx) || idx < WarmupCandles)
+                            continue;
+
+                        var analysis = _strategy.Analyze(symbol, Window(candles, idx), btcRegime.GetValueOrDefault(time));
+                        if (analysis.IsSignal)
+                            candidates.Add((symbol, candles[idx], analysis));
+                    }
+                }
+
+                var ranked = candidates.OrderByDescending(c => c.analysis.Indicators.GetValueOrDefault("SignalStrength")).AsEnumerable();
+                if (StrategyOptions.MaxSignalsPerCycle > 0)
+                    ranked = ranked.Take(StrategyOptions.MaxSignalsPerCycle);
+
+                foreach (var (symbol, candle, analysis) in ranked)
                 {
                     totalSignals++;
 
@@ -199,22 +291,46 @@ public class BacktestService
                     if (latestTestedCandle == null || time > latestTestedCandle)
                         latestTestedCandle = time;
 
+                    var newTrade = new Trade
+                    {
+                        Symbol = symbol,
+                        OpenTime = time,
+                        EntryPrice = candle.Close,
+                        PositionSize = sizing.PositionSize,
+                        Strategy = analysis.StrategyName,
+                        Status = "Open"
+                    };
                     openPositions[symbol] = new OpenPosition
                     {
                         IsLong = isLong,
                         StopLoss = sizing.StopLossPrice,
                         Target = sizing.TargetPrice,
                         Size = sizing.PositionSize,
-                        Trade = new Trade
-                        {
-                            Symbol = symbol,
-                            OpenTime = time,
-                            EntryPrice = candle.Close,
-                            PositionSize = sizing.PositionSize,
-                            Strategy = analysis.StrategyName,
-                            Status = "Open"
-                        }
+                        InitialRisk = candle.Close - sizing.StopLossPrice,
+                        Trade = newTrade
                     };
+
+                    // Contesto all'ingresso (solo diagnostica, per cercare cosa distingue i trade perdenti)
+                    var symCandles = candlesBySymbol[symbol];
+                    var sIdx = indexBySymbol[symbol][time];
+                    var ind = analysis.Indicators;
+                    var inv = System.Globalization.CultureInfo.InvariantCulture;
+                    string F(decimal v) => v.ToString("F4", inv);
+                    var breadth5 = breadthHistory.Count > 5 ? breadthHistory[^6] : breadthNow;
+                    var ret7 = sIdx >= 7 ? symCandles[sIdx].Close / symCandles[sIdx - 7].Close - 1m : 0m;
+                    var ret30 = sIdx >= 30 ? symCandles[sIdx].Close / symCandles[sIdx - 30].Close - 1m : 0m;
+                    var avgVol20 = symCandles.Skip(Math.Max(0, sIdx - 20)).Take(Math.Min(20, sIdx)).Average(c => c.Volume);
+                    tradeFeatures[newTrade.Id] = string.Join(",",
+                        F(breadthNow), F(breadthNow - breadth5),
+                        F(btcDist.GetValueOrDefault(time)), F(btcRet10.GetValueOrDefault(time)),
+                        candidates.Count.ToString(),
+                        F((candle.Close - sizing.StopLossPrice) / candle.Close),
+                        F(ind.GetValueOrDefault("ATR") / candle.Close),
+                        F(ind.GetValueOrDefault("RSI")),
+                        F(ind.GetValueOrDefault("SignalStrength")),
+                        F(ind.GetValueOrDefault("EMA50") > 0 ? (candle.Close / ind["EMA50"] - 1m) : 0m),
+                        F(ret7), F(ret30),
+                        F(avgVol20 > 0 ? candle.Volume / avgVol20 : 0m));
                 }
 
                 maxConcurrent = Math.Max(maxConcurrent, openPositions.Count);
@@ -243,6 +359,16 @@ public class BacktestService
             closedAtEnd++;
         }
 
+        // Export dei trade con il contesto d'ingresso, se BOT7_TRADE_CSV punta a un file (analisi dei trade perdenti)
+        var tradeCsv = Environment.GetEnvironmentVariable("BOT7_TRADE_CSV");
+        if (!string.IsNullOrWhiteSpace(tradeCsv))
+        {
+            var lines = new List<string> { "Symbol,Open,Close,Win,Profit,Breadth,BreadthChg5,BtcDistEma200,BtcRet10,SignalsToday,StopPct,AtrPct,Rsi,Strength,DistEma50,Ret7,Ret30,VolRatio" };
+            foreach (var t in backtestResult.Trades.OrderBy(t => t.OpenTime))
+                lines.Add($"{t.Symbol},{t.OpenTime:yyyy-MM-dd},{t.CloseTime:yyyy-MM-dd},{((t.Profit ?? 0) > 0 ? 1 : 0)},{(t.Profit ?? 0).ToString("F4", System.Globalization.CultureInfo.InvariantCulture)},{tradeFeatures.GetValueOrDefault(t.Id, "")}");
+            File.WriteAllLines(tradeCsv, lines);
+        }
+
         backtestResult.Metrics = _riskManager.CalculatePerformanceMetrics(backtestResult.Trades);
 
         backtestResult.TotalSignalsGenerated = totalSignals;
@@ -255,6 +381,7 @@ public class BacktestService
         backtestResult.TotalCapitalInvested = backtestResult.Trades.Sum(t => t.EntryPrice * t.PositionSize);
         backtestResult.MaxDrawdownAmount = maxDrawdownAmount;
 
+        Console.WriteLine($"\n🌡️  Candele con breadth sotto soglia (nessun nuovo long): {breadthBlockedDays}");
         Console.WriteLine($"\n✅ BACKTEST COMPLETATO ({backtestResult.Trades.Count} trade chiusi da {candleSetsAnalyzed} simboli con dati sufficienti, di cui {closedAtEnd} chiusi a fine periodo al prezzo di mercato)");
 
         return backtestResult;
@@ -366,6 +493,8 @@ internal class OpenPosition
     public decimal StopLoss { get; set; }
     public decimal Target { get; set; }
     public decimal Size { get; set; }
+    public decimal InitialRisk { get; set; } // distanza entry-stop iniziale, per il breakeven
+    public int Held { get; set; }            // candele trascorse dall'ingresso, per l'uscita a tempo
     public Trade Trade { get; set; } = new();
 }
 
